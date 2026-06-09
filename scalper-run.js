@@ -2,22 +2,144 @@ import { createHmac } from "crypto";
 import https from "https";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 
-// Load .env
-readFileSync(new URL(".env", import.meta.url), "utf8")
-  .split("\n")
-  .forEach((line) => {
-    const [k, ...v] = line.split("=");
-    if (k && !k.startsWith("#") && v.length)
-      process.env[k.trim()] = v.join("=").trim();
-  });
+// Load .env if it exists
+if (existsSync(new URL(".env", import.meta.url))) {
+  readFileSync(new URL(".env", import.meta.url), "utf8")
+    .split("\n")
+    .forEach((line) => {
+      const [k, ...v] = line.split("=");
+      if (k && !k.startsWith("#") && v.length)
+        process.env[k.trim()] = v.join("=").trim();
+    });
+}
 
 const API_KEY = process.env.BITGET_API_KEY;
 const SECRET_KEY = process.env.BITGET_SECRET_KEY;
 const PASSPHRASE = process.env.BITGET_PASSPHRASE;
 
-const SYMBOL = "XRPUSDT"; // XRP/USDT spot — low price, above min order size
+const SYMBOL = "XRPUSDT"; // XRP/USDT spot
 const INTERVAL_MS = 10000; // 10 seconds
 const TOTAL_TRADES = 6;
+
+// ── DRY RUN (Simulation) state ──────────────────────────────────
+const IS_DRY_RUN = !API_KEY || !SECRET_KEY || !PASSPHRASE;
+let mockUSDT = 100.0;
+let mockXRP = 0.0;
+let mockLastPrice = 0.5200;
+
+if (IS_DRY_RUN) {
+  console.log("⚠️  BitGet API credentials not fully configured in .env.");
+  console.log("⚠️  Running in SIMULATION (DRY-RUN) mode with mock data and assets.");
+} else {
+  console.log("🚀 Running in LIVE mode connecting to BitGet API.");
+}
+
+// ── Mock request handler ─────────────────────────────────────────
+function mockRequest(method, path, body) {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      // 1. Candles endpoint
+      if (path.includes("/api/v2/spot/market/candles")) {
+        const urlParams = new URLSearchParams(path.split("?")[1]);
+        const limit = parseInt(urlParams.get("limit") || "30");
+        
+        // Generate mock price trend (slightly upward sine wave + random noise)
+        const mockCandles = [];
+        let basePrice = mockLastPrice;
+        let now = Date.now();
+        
+        for (let i = 0; i < limit; i++) {
+          const t = i / 10;
+          const sineOffset = Math.sin(t) * 0.005;
+          const noise = (Math.random() - 0.5) * 0.002;
+          const close = basePrice + sineOffset + noise;
+          const open = close - (Math.random() - 0.5) * 0.002;
+          const high = Math.max(open, close) + Math.random() * 0.001;
+          const low = Math.min(open, close) - Math.random() * 0.001;
+          const vol = 1000 + Math.random() * 5000;
+          
+          mockCandles.push([
+            (now - i * 60000).toString(), // 1 min interval
+            open.toFixed(4),
+            high.toFixed(4),
+            low.toFixed(4),
+            close.toFixed(4),
+            vol.toFixed(2)
+          ]);
+        }
+        
+        // Return latest first (BitGet default is descending order)
+        resolve({ code: "00000", data: mockCandles });
+        return;
+      }
+      
+      // 2. Tickers endpoint
+      if (path.includes("/api/v2/spot/market/tickers")) {
+        // Fluctuate price slightly
+        mockLastPrice += (Math.random() - 0.5) * 0.001;
+        resolve({
+          code: "00000",
+          data: [{ symbol: SYMBOL, lastPr: mockLastPrice.toFixed(4) }]
+        });
+        return;
+      }
+      
+      // 3. Assets endpoint
+      if (path.includes("/api/v2/spot/account/assets")) {
+        resolve({
+          code: "00000",
+          data: [
+            { coin: "USDT", available: mockUSDT.toFixed(4) },
+            { coin: "XRP", available: mockXRP.toFixed(4) }
+          ]
+        });
+        return;
+      }
+      
+      // 4. Place order endpoint
+      if (path.includes("/api/v2/spot/trade/place-order")) {
+        const orderId = "mock-order-" + Math.floor(Math.random() * 1000000);
+        const size = parseFloat(body.size);
+        
+        if (body.side === "buy") {
+          // Spent size USDT
+          mockUSDT -= size;
+          const receivedXRP = size / mockLastPrice;
+          mockXRP += receivedXRP;
+          resolve({
+            code: "00000",
+            msg: "success",
+            data: { orderId, size: size.toString(), baseVolume: receivedXRP.toFixed(4) }
+          });
+        } else {
+          // Sell size XRP
+          mockXRP -= size;
+          const receivedUSDT = size * mockLastPrice;
+          mockUSDT += receivedUSDT;
+          resolve({
+            code: "00000",
+            msg: "success",
+            data: { orderId, size: size.toString(), baseVolume: size.toFixed(4) }
+          });
+        }
+        return;
+      }
+      
+      // 5. Order info endpoint
+      if (path.includes("/api/v2/spot/trade/orderInfo")) {
+        resolve({
+          code: "00000",
+          data: {
+            baseVolume: mockXRP.toFixed(4)
+          }
+        });
+        return;
+      }
+      
+      resolve({ code: "00000", data: {} });
+    }, 100);
+  });
+}
 
 // ── BitGet helpers ──────────────────────────────────────────────
 function sign(ts, method, path, body = "") {
@@ -27,6 +149,10 @@ function sign(ts, method, path, body = "") {
 }
 
 function request(method, path, body = null) {
+  if (IS_DRY_RUN) {
+    return mockRequest(method, path, body);
+  }
+  
   return new Promise((resolve, reject) => {
     const ts = Date.now().toString();
     const bodyStr = body ? JSON.stringify(body) : "";
@@ -59,12 +185,10 @@ function request(method, path, body = null) {
 
 // ── Market data ─────────────────────────────────────────────────
 async function getCandles(symbol, limit = 30) {
-  // 1-minute candles from BitGet
   const res = await request(
     "GET",
     `/api/v2/spot/market/candles?symbol=${symbol}&granularity=1min&limit=${limit}`,
   );
-  // returns [[ts, open, high, low, close, vol], ...]
   return (res.data || []).map((c) => ({
     ts: parseInt(c[0]),
     open: parseFloat(c[1]),
@@ -95,28 +219,46 @@ async function getBalances() {
 
 // ── Indicators ──────────────────────────────────────────────────
 function calcEMA(closes, period) {
+  if (closes.length === 0) return 0;
+  // Not enough data for a full period — fall back to simple average of what we have
+  if (closes.length < period) {
+    return closes.reduce((a, b) => a + b, 0) / closes.length;
+  }
   const k = 2 / (period + 1);
-  let ema = closes[0];
-  for (let i = 1; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
+  // Seed with the SMA of the first `period` closes so the EMA stabilises quickly
+  // instead of being skewed by a single early value.
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
   return ema;
 }
 
-function calcRSI(closes, period = 3) {
+// Wilder's Smoothed RSI calculation to reduce noise and signals
+function calcRSI(closes, period = 14) {
   if (closes.length < period + 1) return 50;
-  let gains = 0,
-    losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
+  
+  let gains = [];
+  let losses = [];
+  
+  for (let i = 1; i < closes.length; i++) {
     const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
+    gains.push(diff > 0 ? diff : 0);
+    losses.push(diff < 0 ? -diff : 0);
   }
-  if (losses === 0) return 100;
-  const rs = gains / losses;
-  return 100 - 100 / (1 + rs);
+
+  let avgGain = gains.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  let avgLoss = losses.slice(0, period).reduce((a, b) => a + b, 0) / period;
+
+  for (let i = period; i < gains.length; i++) {
+    avgGain = (avgGain * (period - 1) + gains[i]) / period;
+    avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
+  }
+
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
 }
 
 function calcVWAP(candles) {
-  // Session VWAP approximation (all candles provided)
   let cumTPV = 0,
     cumVol = 0;
   for (const c of candles) {
@@ -130,20 +272,26 @@ function calcVWAP(candles) {
 // ── Signal logic (mirrors Pine Script) ─────────────────────────
 function getSignal(candles) {
   const closes = candles.map((c) => c.close);
-  const last = closes[closes.length - 1];
+  const last = closes[closes.length - 1]; // This is now correct since we reverse the candles!
 
   const ema8 = calcEMA(closes, 8);
-  const rsi3 = calcRSI(closes, 3);
+  const ema200 = calcEMA(closes, 200); // 200-period EMA for trend filter
+  const rsi3 = calcRSI(closes, 3);     // Wilder's RSI(3)
   const vwap = calcVWAP(candles);
 
   const bullBias = last > vwap && last > ema8;
   const bearBias = last < vwap && last < ema8;
+  const isUpTrend = last > ema200; // Macro trend filter
 
   let signal = "flat";
-  if (bullBias && rsi3 < 30) signal = "buy";
+  // ENTRY (buy): gated by the macro uptrend to avoid buying into a downtrend.
+  if (bullBias && rsi3 < 30 && isUpTrend) signal = "buy";
+  // EXIT (sell): mean-reversion exit on overbought. NOT gated by the trend —
+  // otherwise a position opened in an uptrend could never be closed by signal
+  // and would rely solely on TP/SL. TP/SL still acts as the safety net on top.
   else if (bearBias && rsi3 > 70) signal = "sell";
 
-  return { signal, last, ema8, rsi3, vwap };
+  return { signal, last, ema8, ema200, rsi3, vwap, isUpTrend };
 }
 
 // ── Order helpers ───────────────────────────────────────────────
@@ -159,6 +307,8 @@ async function placeOrder(side, size) {
 }
 
 async function getOrderFill(orderId) {
+  if (IS_DRY_RUN) return mockXRP;
+  
   for (let i = 0; i < 5; i++) {
     await new Promise((r) => setTimeout(r, 1000));
     const res = await request(
@@ -171,10 +321,13 @@ async function getOrderFill(orderId) {
   return 0;
 }
 
-// BitGet locks newly purchased assets against immediate resale (anti-wash-trading).
-// This retries the sell, parsing the actually-available amount from the error
-// message until the lock lifts or we time out.
 async function placeSellWithRetry(qty, maxRetries = 12, retryDelayMs = 3000) {
+  if (IS_DRY_RUN) {
+    const size = (Math.floor(qty * 10000) / 10000).toFixed(4);
+    const res = await placeOrder("sell", size);
+    return { ok: true, res, soldQty: parseFloat(size) };
+  }
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const size = (Math.floor(qty * 10000) / 10000).toFixed(4);
     const res = await placeOrder("sell", size);
@@ -182,7 +335,6 @@ async function placeSellWithRetry(qty, maxRetries = 12, retryDelayMs = 3000) {
     if (res.code === "00000")
       return { ok: true, res, soldQty: parseFloat(size) };
 
-    // Parse available qty from lock error: "0.001234XRP can be used at most"
     const lockMatch = res.msg?.match(/([\d.]+)XRP can be used at most/i);
     if (lockMatch) {
       const available = parseFloat(lockMatch[1]);
@@ -193,7 +345,6 @@ async function placeSellWithRetry(qty, maxRetries = 12, retryDelayMs = 3000) {
       continue;
     }
 
-    // Any other error — don't retry
     return { ok: false, res, soldQty: 0 };
   }
   return {
@@ -205,7 +356,7 @@ async function placeSellWithRetry(qty, maxRetries = 12, retryDelayMs = 3000) {
 
 // ── Main loop ───────────────────────────────────────────────────
 async function main() {
-  console.log(`\n🤖 BTC Scalper — VWAP + RSI(3) + EMA(8)`);
+  console.log(`\n🤖 XRP Scalper (Improved) — VWAP + RSI(3) + EMA(8) + Trend Filter`);
   console.log(
     `Symbol: ${SYMBOL} | ${TOTAL_TRADES} trades × ${INTERVAL_MS / 1000}s\n`,
   );
@@ -213,20 +364,48 @@ async function main() {
   const log = [];
   let holding = "usdt";
   let lastBuyXrpQty = 0;
+  let entryPrice = 0;
+  
+  const TAKE_PROFIT_PCT = 0.02; // Take Profit at +2%
+  const STOP_LOSS_PCT = 0.01;   // Stop Loss at -1%
 
   for (let i = 1; i <= TOTAL_TRADES; i++) {
     const ts = new Date().toISOString();
-    const candles = await getCandles(SYMBOL, 30);
-    const { signal, last, ema8, rsi3, vwap } = getSignal(candles);
+    
+    // Fetch 231 candles to calculate 200 EMA of closed candles
+    const rawCandles = await getCandles(SYMBOL, 231);
+    
+    // Sort ascending (oldest first) and take closed candles (skip index 230 which is current active candle)
+    const candles = rawCandles.reverse().slice(0, 230);
+    
+    const { signal: rawSignal, last, ema8, ema200, rsi3, vwap } = getSignal(candles);
     const bals = await getBalances();
+    
+    let signal = rawSignal;
 
     console.log(`[${i}/${TOTAL_TRADES}] ${ts}`);
     console.log(
-      `  Price: $${last.toFixed(4)} | EMA8: ${ema8.toFixed(4)} | RSI3: ${rsi3.toFixed(1)} | VWAP: ${vwap.toFixed(4)}`,
+      `  Price: $${last.toFixed(4)} | EMA8: ${ema8.toFixed(4)} | EMA200: ${ema200.toFixed(4)} | RSI3: ${rsi3.toFixed(1)} | VWAP: ${vwap.toFixed(4)}`,
     );
     console.log(
-      `  USDT: $${bals.usdt.toFixed(4)} | XRP: ${bals.xrp.toFixed(4)} | Signal: ${signal.toUpperCase()}`,
+      `  USDT: $${bals.usdt.toFixed(4)} | XRP: ${bals.xrp.toFixed(4)}`
     );
+
+    // ── Risk management check (Stop Loss / Take Profit) ───────────
+    if (holding === "xrp" && entryPrice > 0) {
+      const priceChangePct = (last - entryPrice) / entryPrice;
+      console.log(`  Position ROI: ${(priceChangePct * 100).toFixed(2)}%`);
+      
+      if (priceChangePct >= TAKE_PROFIT_PCT) {
+        console.log(`  🎯 Take Profit target reached (+${(TAKE_PROFIT_PCT * 100).toFixed(1)}%)! Overriding signal to SELL.`);
+        signal = "sell";
+      } else if (priceChangePct <= -STOP_LOSS_PCT) {
+        console.log(`  🛑 Stop Loss triggered (-${(STOP_LOSS_PCT * 100).toFixed(1)}%)! Overriding signal to SELL.`);
+        signal = "sell";
+      }
+    }
+
+    console.log(`  Signal: ${signal.toUpperCase()}`);
 
     let side, size, label;
     const entry = {
@@ -234,6 +413,7 @@ async function main() {
       timestamp: ts,
       price: last,
       ema8,
+      ema200,
       rsi3,
       vwap,
       signal,
@@ -242,10 +422,10 @@ async function main() {
 
     if (signal === "buy" && holding === "usdt" && bals.usdt >= 1) {
       side = "buy";
-      size = (bals.usdt * 0.9).toFixed(4);
+      size = (bals.usdt * 0.95).toFixed(4); // Use 95% of available funds
       label = `BUY XRP with $${size} USDT`;
       holding = "xrp";
-    } else if (signal === "sell" && holding === "xrp" && lastBuyXrpQty >= 1) {
+    } else if (signal === "sell" && holding === "xrp" && lastBuyXrpQty > 0) {
       side = "sell";
       size = (Math.floor(lastBuyXrpQty * 10000) / 10000).toFixed(4);
       label = `SELL ${size} XRP → USDT`;
@@ -278,8 +458,9 @@ async function main() {
       if (ok) {
         console.log(`  ✅ BUY PLACED — ${orderId}`);
         lastBuyXrpQty = await getOrderFill(orderId);
+        entryPrice = last; // Set entry price
         console.log(
-          `  📦 Filled: ${lastBuyXrpQty.toFixed(4)} XRP — waiting for lock to clear...`,
+          `  📦 Filled: ${lastBuyXrpQty.toFixed(4)} XRP (at $${entryPrice.toFixed(4)}) — waiting for lock to clear...`,
         );
         entry.filledQty = lastBuyXrpQty;
       } else {
@@ -287,19 +468,19 @@ async function main() {
         holding = "usdt";
       }
     } else {
-      // Use retry loop — handles BitGet's anti-wash-trading lock automatically
       const { ok, res, soldQty } = await placeSellWithRetry(lastBuyXrpQty);
       entry.orderId = res.data?.orderId || res.msg;
       entry.orderPlaced = ok;
 
       if (ok) {
         console.log(
-          `  ✅ SELL PLACED — ${entry.orderId} (${soldQty.toFixed(4)} XRP)`,
+          `  ✅ SELL PLACED — ${entry.orderId} (${soldQty.toFixed(4)} XRP)`
         );
         lastBuyXrpQty = 0;
+        entryPrice = 0; // Reset entry price
       } else {
         console.log(`  ❌ Sell failed: ${res.msg}`);
-        holding = "xrp"; // still holding
+        holding = "xrp";
       }
     }
 

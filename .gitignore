@@ -5,6 +5,9 @@ temp_*
 *.log
 discovery-log.json
 
+# Generated knowledge graph (understand-anything)
+.understand-anything/
+
 # Secrets — never commit
 .env
 .env.*
